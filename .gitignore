@@ -1,0 +1,7 @@
+.DS_Store
+error_log
+config/config.php
+assets/uploads/ads/*
+assets/uploads/logo/*
+assets/uploads/support/*
+!assets/uploads/**/.gitkeep
