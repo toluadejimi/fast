@@ -12,6 +12,77 @@ require_once __DIR__ . '/includes/admin_header.php';
 
 $error = $success = '';
 
+function gateway_defaults(string $name): array {
+    return [
+        'gateway'       => $name,
+        'public_key'    => '',
+        'secret_key'    => '',
+        'extra'         => '',
+        'extra2'        => '',
+        'txn_pin'       => '',
+        'business_name' => '',
+        'is_active'     => 0,
+    ];
+}
+
+function ensure_gateway_row(string $name): array {
+    global $pdo;
+    $defaults = gateway_defaults($name);
+
+    try {
+        $s = $pdo->prepare("SELECT * FROM payment_gateways WHERE gateway = ? LIMIT 1");
+        $s->execute([$name]);
+        $row = $s->fetch();
+        if ($row) return array_merge($defaults, $row);
+    } catch (Exception $e) {
+        return $defaults;
+    }
+
+    try {
+        $pdo->prepare("INSERT INTO payment_gateways (gateway, is_active) VALUES (?, 0)")->execute([$name]);
+    } catch (Exception $e) {
+        try {
+            $col = $pdo->query("SHOW COLUMNS FROM payment_gateways LIKE 'gateway'")->fetch();
+            $type = (string)($col['Type'] ?? '');
+            if (stripos($type, 'enum(') === 0) {
+                preg_match_all("/'([^']+)'/", $type, $m);
+                $vals = $m[1] ?? [];
+                if (!in_array($name, $vals, true)) {
+                    $vals[] = $name;
+                    $enum = implode(',', array_map(static function ($v) {
+                        return "'" . str_replace("'", "''", $v) . "'";
+                    }, $vals));
+                    $pdo->exec("ALTER TABLE payment_gateways MODIFY gateway ENUM($enum) NOT NULL");
+                    $pdo->prepare("INSERT INTO payment_gateways (gateway, is_active) VALUES (?, 0)")->execute([$name]);
+                }
+            } else {
+                $pdo->exec("ALTER TABLE payment_gateways MODIFY gateway VARCHAR(64) NOT NULL");
+                $pdo->prepare("INSERT INTO payment_gateways (gateway, is_active) VALUES (?, 0)")->execute([$name]);
+            }
+        } catch (Exception $ignored) { /* page still renders with defaults */ }
+    }
+
+    try {
+        $s = $pdo->prepare("SELECT * FROM payment_gateways WHERE gateway = ? LIMIT 1");
+        $s->execute([$name]);
+        $row = $s->fetch();
+        if ($row) return array_merge($defaults, $row);
+    } catch (Exception $e) {}
+
+    return $defaults;
+}
+
+function save_gateway_keys(string $name, string $publicKey, string $secretKey, int $active): void {
+    global $pdo;
+    ensure_gateway_row($name);
+    $upd = $pdo->prepare("UPDATE payment_gateways SET public_key=?, secret_key=?, is_active=? WHERE gateway=?");
+    $upd->execute([$publicKey, $secretKey, $active, $name]);
+    if ($upd->rowCount() === 0) {
+        $pdo->prepare("INSERT INTO payment_gateways (gateway, public_key, secret_key, is_active) VALUES (?,?,?,?)")
+            ->execute([$name, $publicKey, $secretKey, $active]);
+    }
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!verify_csrf($_POST['csrf_token'] ?? '')) {
         $error = 'Invalid CSRF token. Please refresh and try again.';
@@ -76,8 +147,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $apiKey = trim($_POST['sp_api_key'] ?? '');
             $secret = trim($_POST['sp_secret'] ?? '');
             $active = isset($_POST['sp_active']) ? 1 : 0;
-            $pdo->prepare("UPDATE payment_gateways SET public_key=?,secret_key=?,is_active=? WHERE gateway='sprintpay'")
-                ->execute([$apiKey, $secret, $active]);
+            save_gateway_keys('sprintpay', $apiKey, $secret, $active);
             $success = '✅ SprintPay settings saved successfully.';
         }
 
@@ -97,18 +167,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // ── Fetch current config ──────────────────────────────────────
-$pp      = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='paymentpoint'")->fetch();
-$nc      = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='ncwallet'")->fetch();
-$ps      = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='paystack'")->fetch();
-$sp      = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='sprintpay'")->fetch();
+$pp      = ensure_gateway_row('paymentpoint');
+$nc      = ensure_gateway_row('ncwallet');
+$ps      = ensure_gateway_row('paystack');
+$sp      = ensure_gateway_row('sprintpay');
 $fallback= get_setting('usd_ngn_fallback_rate', '1600');
 $liveRate= get_setting('usd_ngn_rate', '');
-
-// Ensure rows exist
-if (!$pp) { $pdo->query("INSERT IGNORE INTO payment_gateways (gateway,is_active) VALUES ('paymentpoint',0)"); $pp = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='paymentpoint'")->fetch(); }
-if (!$nc) { $pdo->query("INSERT IGNORE INTO payment_gateways (gateway,is_active) VALUES ('ncwallet',0)"); $nc = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='ncwallet'")->fetch(); }
-if (!$ps) { $pdo->query("INSERT IGNORE INTO payment_gateways (gateway,is_active) VALUES ('paystack',0)"); $ps = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='paystack'")->fetch(); }
-if (!$sp) { $pdo->query("INSERT IGNORE INTO payment_gateways (gateway,is_active) VALUES ('sprintpay',0)"); $sp = $pdo->query("SELECT * FROM payment_gateways WHERE gateway='sprintpay'")->fetch(); }
 ?>
 
 <?php if ($error): ?>
@@ -353,7 +417,7 @@ if (!$sp) { $pdo->query("INSERT IGNORE INTO payment_gateways (gateway,is_active)
       <div style="font-weight:800;font-size:15px;">SprintPay</div>
       <div style="font-size:12px;color:var(--text2);">Collection API · Bank · Card · Crypto · Hosted checkout</div>
     </div>
-    <span class="pill pill-<?= $sp['is_active'] ? 'success' : 'gray' ?>"><?= $sp['is_active'] ? 'Active' : 'Off' ?></span>
+    <span class="pill pill-<?= !empty($sp['is_active']) ? 'success' : 'gray' ?>"><?= !empty($sp['is_active']) ? 'Active' : 'Off' ?></span>
   </div>
 
   <form method="POST">
@@ -376,7 +440,7 @@ if (!$sp) { $pdo->query("INSERT IGNORE INTO payment_gateways (gateway,is_active)
 
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
       <input type="checkbox" name="sp_active" id="sp-on"
-             <?= $sp['is_active'] ? 'checked' : '' ?>
+             <?= !empty($sp['is_active']) ? 'checked' : '' ?>
              style="width:18px;height:18px;accent-color:var(--primary);">
       <label for="sp-on" style="font-size:14px;font-weight:600;cursor:pointer;">Enable SprintPay</label>
     </div>
